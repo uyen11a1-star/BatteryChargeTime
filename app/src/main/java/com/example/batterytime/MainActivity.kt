@@ -23,18 +23,16 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var lastIntent: Intent? = null
 
-    private val currentSamples = ArrayList<Long>()
+    private val currentSamples = ArrayList<Long>()   // µA
     private val percentSamples = ArrayList<Pair<Long, Int>>()
     private var designCapacityUAh = 5_000_000L
     private var lastCharging = false
+    private var unitDetected = "?"                   // "uA" hoặc "mA"
 
     private val receiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context?, i: Intent?) {
-            i?.let { lastIntent = it }
-        }
+        override fun onReceive(c: Context?, i: Intent?) { i?.let { lastIntent = it } }
     }
 
-    // Tự cập nhật mỗi 1 giây → số nhảy realtime
     private val ticker = object : Runnable {
         override fun run() {
             lastIntent?.let { update(it) }
@@ -52,7 +50,6 @@ class MainActivity : AppCompatActivity() {
         designCapacityUAh = readDesignCapacity()
     }
 
-    // Đọc dung lượng pin thiết kế từ hệ thống
     private fun readDesignCapacity(): Long {
         val paths = listOf(
             "/sys/class/power_supply/battery/charge_full_design",
@@ -69,7 +66,7 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (_: Exception) {}
         }
-        return 5_000_000L // 5000 mAh default
+        return 5_000_000L
     }
 
     override fun onResume() {
@@ -82,6 +79,18 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         try { unregisterReceiver(receiver) } catch (_: Exception) {}
         handler.removeCallbacks(ticker)
+    }
+
+    // ── TỰ NHẬN DIỆN ĐƠN VỊ ─────────────────────────
+    // Android chuẩn: µA. Nhiều ROM (Xiaomi/Samsung/OPPO): mA.
+    // Dấu hiệu: sạc thật thường ≥ 500 mA. Nếu raw < 10000 → chắc chắn là mA.
+    private fun normalizeCurrent(raw: Int): Long {
+        val abs = if (raw < 0) -raw.toLong() else raw.toLong()
+        return when {
+            abs < 100L      -> 0L                    // giá trị rác
+            abs < 10_000L   -> { unitDetected = "mA"; abs * 1000L }   // mA → µA
+            else            -> { unitDetected = "µA"; abs }            // đã là µA
+        }
     }
 
     private fun update(intent: Intent) {
@@ -97,35 +106,31 @@ class MainActivity : AppCompatActivity() {
         val chargeCounter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
         val rawCurrent = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
 
-        // Reset khi đổi trạng thái sạc
         if (isCharging != lastCharging) {
-            currentSamples.clear()
-            percentSamples.clear()
-            lastCharging = isCharging
+            currentSamples.clear(); percentSamples.clear(); lastCharging = isCharging
         }
 
-        val absCurrent = if (rawCurrent < 0) -rawCurrent.toLong() else rawCurrent.toLong()
+        val uA = normalizeCurrent(rawCurrent)
 
-        // Lưu mẫu dòng (chỉ khi sạc và dòng hợp lý)
-        if (isCharging && absCurrent > 10_000) {
-            currentSamples.add(absCurrent)
+        // Lưu mẫu dòng khi sạc (chỉ nhận giá trị hợp lý: 100mA - 8A)
+        if (isCharging && uA in 100_000L..8_000_000L) {
+            currentSamples.add(uA)
             if (currentSamples.size > 8) currentSamples.removeAt(0)
         }
 
-        // Theo dõi % theo thời gian
+        // Theo dõi % tăng
         val now = System.currentTimeMillis()
         if (percentSamples.isEmpty() || percentSamples.last().second != percent) {
             percentSamples.add(now to percent)
-            if (percentSamples.size > 20) percentSamples.removeAt(0)
+            if (percentSamples.size > 30) percentSamples.removeAt(0)
         }
 
-        // Trung bình có loại nhiễu (bỏ 25% cao nhất & thấp nhất)
         val avgCurrent = if (currentSamples.isNotEmpty()) {
             val sorted = currentSamples.sorted()
             val trim = sorted.size / 4
             val trimmed = if (sorted.size > 4) sorted.subList(trim, sorted.size - trim) else sorted
             trimmed.average().toLong()
-        } else absCurrent
+        } else 0L
 
         tvStatus.text = when {
             isFull -> "Đầy pin 🎉"
@@ -140,48 +145,47 @@ class MainActivity : AppCompatActivity() {
             else -> estimate(percent, chargeCounter, avgCurrent)
         }
 
-        tvCurrent.text = String.format(Locale.US, "Dòng TB: %.0f mA (n=%d)",
-            avgCurrent / 1000.0, currentSamples.size)
+        tvCurrent.text = if (avgCurrent > 0)
+            String.format(Locale.US, "Dòng TB: %.2f A (n=%d, %s)",
+                avgCurrent / 1_000_000.0, currentSamples.size, unitDetected)
+        else
+            String.format(Locale.US, "Đo được: %d %s (raw=%d)",
+                if (unitDetected == "mA") uA / 1000 else uA,
+                if (unitDetected == "mA") "mA" else "µA", rawCurrent)
     }
 
     private fun estimate(percent: Int, chargeCounter: Int, avgCurrent: Long): String {
-        if (percent in 1..99) {
-            // TẦNG 1: charge_counter (chính xác nhất)
-            if (chargeCounter > 100_000 && avgCurrent > 50_000) {
-                val fullCap = chargeCounter.toLong() * 100L / percent
-                val remaining = fullCap - chargeCounter
-                if (remaining > 0) {
-                    val mins = (remaining.toDouble() / avgCurrent * 60).toInt()
-                    if (mins in 1..600) return formatTime(mins, "Còn")
-                }
-            }
+        if (percent !in 1..99) return ""
 
-            // TẦNG 2: dung lượng thiết kế
-            if (avgCurrent > 50_000) {
-                val full = designCapacityUAh
-                val current = full * percent / 100
-                val remaining = full - current
-                if (remaining > 0) {
-                    val mins = (remaining.toDouble() / avgCurrent * 60).toInt()
-                    if (mins in 1..600) return formatTime(mins, "~Còn")
-                }
+        // TẦNG 1: có dòng thật → tính chuẩn
+        if (avgCurrent > 100_000L) {
+            val remaining = if (chargeCounter > 100_000) {
+                chargeCounter.toLong() * (100L - percent) / percent
+            } else {
+                designCapacityUAh * (100L - percent) / 100L
             }
+            val mins = (remaining.toDouble() / avgCurrent * 60).toInt()
+            if (mins in 1..900) return formatTime(mins, "Còn")
         }
 
-        // TẦNG 3: đo tốc độ tăng %
-        if (percentSamples.size >= 3 && percent in 1..99) {
+        // TẦNG 2: đo tốc độ tăng % theo thời gian
+        if (percentSamples.size >= 2) {
             val first = percentSamples.first()
             val last = percentSamples.last()
             val dP = last.second - first.second
             val dT = (last.first - first.first) / 60_000.0
-            if (dP > 0 && dT > 1.0) {
-                val rate = dP / dT
+            if (dP >= 1 && dT >= 0.5) {
+                val rate = dP / dT               // %/phút
                 val mins = ((100 - percent) / rate).toInt()
-                if (mins in 1..600) return formatTime(mins, "~Còn")
+                if (mins in 1..900) return formatTime(mins, "~Còn")
             }
         }
 
-        return "Đang đo dòng sạc..."
+        // TẦNG 3: tạm tính theo sạc chuẩn 10W (~2000 mA)
+        val remaining = designCapacityUAh * (100L - percent) / 100L
+        val mins = (remaining.toDouble() / 2_000_000.0 * 60).toInt()
+        return if (mins in 1..900) formatTime(mins, "~Còn (tạm tính)")
+        else "Đang hiệu chỉnh..."
     }
 
     private fun formatTime(mins: Int, prefix: String): String {
