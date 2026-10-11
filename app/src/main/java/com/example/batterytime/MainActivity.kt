@@ -10,7 +10,6 @@ import android.os.Handler
 import android.os.Looper
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import java.io.File
 import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
@@ -23,14 +22,15 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var lastIntent: Intent? = null
 
-    private val currentSamples = ArrayList<Long>()   // µA
-    private val percentSamples = ArrayList<Pair<Long, Int>>()
-    private var designCapacityUAh = 5_000_000L
+    // Lịch sử đo tốc độ sạc: lưu cặp (thời điểm, phần trăm pin)
+    private val percentHistory = ArrayList<Pair<Long, Int>>()
+    private var lastPercent = -1
     private var lastCharging = false
-    private var unitDetected = "?"                   // "uA" hoặc "mA"
 
     private val receiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context?, i: Intent?) { i?.let { lastIntent = it } }
+        override fun onReceive(c: Context?, i: Intent?) {
+            i?.let { lastIntent = it }
+        }
     }
 
     private val ticker = object : Runnable {
@@ -47,26 +47,6 @@ class MainActivity : AppCompatActivity() {
         tvPercent = findViewById(R.id.tvPercent)
         tvTime    = findViewById(R.id.tvTime)
         tvCurrent = findViewById(R.id.tvCurrent)
-        designCapacityUAh = readDesignCapacity()
-    }
-
-    private fun readDesignCapacity(): Long {
-        val paths = listOf(
-            "/sys/class/power_supply/battery/charge_full_design",
-            "/sys/class/power_supply/BAT0/charge_full_design",
-            "/sys/class/power_supply/bms/charge_full_design",
-            "/sys/class/power_supply/battery/charge_full"
-        )
-        for (p in paths) {
-            try {
-                val f = File(p)
-                if (f.canRead()) {
-                    val v = f.readText().trim().toLongOrNull()
-                    if (v != null && v > 100_000) return v
-                }
-            } catch (_: Exception) {}
-        }
-        return 5_000_000L
     }
 
     override fun onResume() {
@@ -81,20 +61,7 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(ticker)
     }
 
-    // ── TỰ NHẬN DIỆN ĐƠN VỊ ─────────────────────────
-    // Android chuẩn: µA. Nhiều ROM (Xiaomi/Samsung/OPPO): mA.
-    // Dấu hiệu: sạc thật thường ≥ 500 mA. Nếu raw < 10000 → chắc chắn là mA.
-    private fun normalizeCurrent(raw: Int): Long {
-        val abs = if (raw < 0) -raw.toLong() else raw.toLong()
-        return when {
-            abs < 100L      -> 0L                    // giá trị rác
-            abs < 10_000L   -> { unitDetected = "mA"; abs * 1000L }   // mA → µA
-            else            -> { unitDetected = "µA"; abs }            // đã là µA
-        }
-    }
-
     private fun update(intent: Intent) {
-        val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
         val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
         val percent = if (scale > 0) level * 100 / scale else -1
@@ -103,34 +70,12 @@ class MainActivity : AppCompatActivity() {
         val isFull = status == BatteryManager.BATTERY_STATUS_FULL
         val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || isFull
 
-        val chargeCounter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
-        val rawCurrent = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
-
-        if (isCharging != lastCharging) {
-            currentSamples.clear(); percentSamples.clear(); lastCharging = isCharging
+        // Reset khi bắt đầu một phiên sạc mới
+        if (isCharging && !lastCharging) {
+            percentHistory.clear()
+            lastPercent = -1
         }
-
-        val uA = normalizeCurrent(rawCurrent)
-
-        // Lưu mẫu dòng khi sạc (chỉ nhận giá trị hợp lý: 100mA - 8A)
-        if (isCharging && uA in 100_000L..8_000_000L) {
-            currentSamples.add(uA)
-            if (currentSamples.size > 8) currentSamples.removeAt(0)
-        }
-
-        // Theo dõi % tăng
-        val now = System.currentTimeMillis()
-        if (percentSamples.isEmpty() || percentSamples.last().second != percent) {
-            percentSamples.add(now to percent)
-            if (percentSamples.size > 30) percentSamples.removeAt(0)
-        }
-
-        val avgCurrent = if (currentSamples.isNotEmpty()) {
-            val sorted = currentSamples.sorted()
-            val trim = sorted.size / 4
-            val trimmed = if (sorted.size > 4) sorted.subList(trim, sorted.size - trim) else sorted
-            trimmed.average().toLong()
-        } else 0L
+        lastCharging = isCharging
 
         tvStatus.text = when {
             isFull -> "Đầy pin 🎉"
@@ -139,61 +84,113 @@ class MainActivity : AppCompatActivity() {
         }
         tvPercent.text = "$percent%"
 
-        tvTime.text = when {
-            isFull || percent >= 100 -> "Pin đã đầy 🎉"
-            !isCharging -> "Cắm sạc để xem thời gian đầy pin"
-            else -> estimate(percent, chargeCounter, avgCurrent)
-        }
+        // Tính toán khi đang sạc và pin chưa đầy
+        if (isCharging && percent in 1..99) {
+            val now = System.currentTimeMillis()
 
-        tvCurrent.text = if (avgCurrent > 0)
-            String.format(Locale.US, "Dòng TB: %.2f A (n=%d, %s)",
-                avgCurrent / 1_000_000.0, currentSamples.size, unitDetected)
-        else
-            String.format(Locale.US, "Đo được: %d %s (raw=%d)",
-                if (unitDetected == "mA") uA / 1000 else uA,
-                if (unitDetected == "mA") "mA" else "µA", rawCurrent)
+            // Ghi lại lịch sử khi phần trăm thay đổi
+            if (percent != lastPercent) {
+                percentHistory.add(now to percent)
+                lastPercent = percent
+
+                // Giới hạn bộ nhớ đệm (giữ 50 bản ghi gần nhất)
+                if (percentHistory.size > 50) {
+                    percentHistory.removeAt(0)
+                }
+            }
+
+            // Ước lượng thời gian dựa trên tốc độ sạc đo được
+            val estimate = estimateChargingTime(percent)
+            tvTime.text = estimate
+
+            // Hiển thị tốc độ sạc thực tế đã đo được (nếu có)
+            val rateText = getChargingRateText()
+            tvCurrent.text = rateText
+
+        } else if (isFull || percent >= 100) {
+            tvTime.text = "Pin đã đầy 🎉"
+            tvCurrent.text = ""
+        } else {
+            tvTime.text = "Cắm sạc để xem thời gian đầy pin"
+            tvCurrent.text = ""
+        }
     }
 
-    private fun estimate(percent: Int, chargeCounter: Int, avgCurrent: Long): String {
-        if (percent !in 1..99) return ""
-
-        // TẦNG 1: có dòng thật → tính chuẩn
-        if (avgCurrent > 100_000L) {
-            val remaining = if (chargeCounter > 100_000) {
-                chargeCounter.toLong() * (100L - percent) / percent
-            } else {
-                designCapacityUAh * (100L - percent) / 100L
-            }
-            val mins = (remaining.toDouble() / avgCurrent * 60).toInt()
-            if (mins in 1..900) return formatTime(mins, "Còn")
+    /**
+     * Ước lượng thời gian sạc còn lại dựa trên tốc độ sạc đo được từ lịch sử.
+     */
+    private fun estimateChargingTime(currentPercent: Int): String {
+        // Cần ít nhất 2 điểm dữ liệu để tính tốc độ
+        if (percentHistory.size < 2) {
+            return "Đang đo tốc độ sạc..."
         }
 
-        // TẦNG 2: đo tốc độ tăng % theo thời gian
-        if (percentSamples.size >= 2) {
-            val first = percentSamples.first()
-            val last = percentSamples.last()
-            val dP = last.second - first.second
-            val dT = (last.first - first.first) / 60_000.0
-            if (dP >= 1 && dT >= 0.5) {
-                val rate = dP / dT               // %/phút
-                val mins = ((100 - percent) / rate).toInt()
-                if (mins in 1..900) return formatTime(mins, "~Còn")
-            }
+        // Lấy điểm đầu và điểm cuối trong lịch sử (bỏ qua các điểm nhiễu)
+        val validHistory = percentHistory.filter { it.second in 1..99 }
+        if (validHistory.size < 2) {
+            return "Đang đo tốc độ sạc..."
         }
 
-        // TẦNG 3: tạm tính theo sạc chuẩn 10W (~2000 mA)
-        val remaining = designCapacityUAh * (100L - percent) / 100L
-        val mins = (remaining.toDouble() / 2_000_000.0 * 60).toInt()
-        return if (mins in 1..900) formatTime(mins, "~Còn (tạm tính)")
-        else "Đang hiệu chỉnh..."
+        val first = validHistory.first()
+        val last = validHistory.last()
+
+        val deltaPercent = last.second - first.second
+        val deltaTimeMs = last.first - first.first
+
+        // Cần ít nhất 2% pin tăng và 30 giây thời gian để có kết quả đáng tin cậy
+        if (deltaPercent < 2 || deltaTimeMs < 30_000) {
+            return "Đang đo tốc độ sạc..."
+        }
+
+        // Tính tốc độ sạc: % pin mỗi phút
+        val ratePerMinute = deltaPercent.toDouble() / (deltaTimeMs / 60_000.0)
+
+        if (ratePerMinute <= 0.01) { // Tốc độ quá chậm, có thể đang gần đầy
+            return "Pin đang sạc rất chậm (gần đầy)"
+        }
+
+        // Tính thời gian còn lại
+        val remainingPercent = 100 - currentPercent
+        val remainingMinutes = (remainingPercent / ratePerMinute).toInt()
+
+        return formatTime(remainingMinutes)
     }
 
-    private fun formatTime(mins: Int, prefix: String): String {
-        val h = mins / 60
-        val m = mins % 60
+    /**
+     * Lấy text hiển thị tốc độ sạc thực tế đã đo được.
+     */
+    private fun getChargingRateText(): String {
+        val validHistory = percentHistory.filter { it.second in 1..99 }
+        if (validHistory.size < 2) {
+            return "Đang đo tốc độ sạc..."
+        }
+
+        val first = validHistory.first()
+        val last = validHistory.last()
+        val deltaPercent = last.second - first.second
+        val deltaTimeMs = last.first - first.first
+
+        if (deltaPercent < 1 || deltaTimeMs < 15_000) {
+            return "Đang đo tốc độ sạc..."
+        }
+
+        val ratePerMinute = deltaPercent.toDouble() / (deltaTimeMs / 60_000.0)
+
+        return String.format(Locale.US, "Tốc độ: %.2f%%/phút", ratePerMinute)
+    }
+
+    private fun formatTime(minutes: Int): String {
+        if (minutes < 0 || minutes > 1440) { // > 24 giờ thì vô lý
+            return "Đang đo tốc độ sạc..."
+        }
+
+        val h = minutes / 60
+        val m = minutes % 60
+
         return when {
-            h > 0 -> "$prefix $h giờ $m phút nữa đầy"
-            m > 0 -> "$prefix $m phút nữa đầy"
+            h > 0 && m > 0 -> "Còn khoảng $h giờ $m phút nữa đầy"
+            h > 0 -> "Còn khoảng $h giờ nữa đầy"
+            m > 0 -> "Còn khoảng $m phút nữa đầy"
             else -> "Sắp đầy rồi!"
         }
     }
