@@ -1,13 +1,13 @@
 package com.example.batterytime
 
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.os.BatteryManager
-import android.os.Bundle
+import android.Manifest
+import android.content.*
+import android.content.pm.PackageManager
+import android.os.*
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
@@ -30,6 +30,26 @@ class MainActivity : AppCompatActivity() {
         tvPercent = findViewById(R.id.tvPercent)
         tvTime    = findViewById(R.id.tvTime)
         tvCurrent = findViewById(R.id.tvCurrent)
+
+        // Xin quyền thông báo (Android 13+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(
+                    this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+            }
+        }
+
+        startChargingService()
+    }
+
+    private fun startChargingService() {
+        val i = Intent(this, ChargingService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(i)
+        } else {
+            startService(i)
+        }
     }
 
     override fun onResume() {
@@ -44,7 +64,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun update(intent: Intent) {
         val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-
         val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
         val percent = if (scale > 0) level * 100 / scale else -1
@@ -64,23 +83,18 @@ class MainActivity : AppCompatActivity() {
         tvPercent.text = "$percent%"
 
         if (isCharging && percent in 1..99 && chargeCounter > 0) {
-            val fullCapacity = chargeCounter.toLong() * 100L / percent
-            val remainingUAh = fullCapacity - chargeCounter
-            val currentAbs = kotlin.math.abs(currentNow).toLong()
-
-            if (remainingUAh > 0 && currentAbs > 1000) {
-                val hours = remainingUAh.toDouble() / currentAbs.toDouble()
-                val totalMin = (hours * 60).toInt()
-                val h = totalMin / 60
-                val m = totalMin % 60
+            val fullCap = chargeCounter.toLong() * 100L / percent
+            val remaining = fullCap - chargeCounter
+            val curAbs = kotlin.math.abs(currentNow).toLong()
+            if (remaining > 0 && curAbs > 1000) {
+                val mins = (remaining.toDouble() / curAbs * 60).toInt()
+                val h = mins / 60; val m = mins % 60
                 tvTime.text = when {
-                    h > 0 -> "Còn khoảng ${h} giờ ${m} phút nữa đầy"
-                    m > 0 -> "Còn khoảng ${m} phút nữa đầy"
+                    h > 0 -> "Còn khoảng $h giờ $m phút nữa đầy"
+                    m > 0 -> "Còn khoảng $m phút nữa đầy"
                     else -> "Sắp đầy rồi!"
                 }
-            } else {
-                tvTime.text = "Đang tính toán..."
-            }
+            } else tvTime.text = "Đang tính toán..."
         } else if (isFull || percent >= 100) {
             tvTime.text = "Pin đã đầy 🎉"
         } else {
