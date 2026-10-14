@@ -29,6 +29,9 @@ class MainActivity : AppCompatActivity() {
     private var designCapacityUAh = 5_000_000L
     private var lastPercent = -1
 
+    // Hệ số công suất củ sạc (suy ra từ dòng đo được hoặc mặc định)
+    private var chargerWattage = 0.0
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) { i?.let { lastIntent = it } }
     }
@@ -62,7 +65,6 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(ticker)
     }
 
-    // ─── Đọc dung lượng pin thiết kế từ sysfs ───
     private fun readDesignCapacity(): Long {
         val paths = listOf(
             "/sys/class/power_supply/battery/charge_full_design",
@@ -83,7 +85,6 @@ class MainActivity : AppCompatActivity() {
         return 5_000_000L
     }
 
-    // ─── TẦNG 3: Đọc dòng sạc trực tiếp từ sysfs ───
     private fun readCurrentFromSysfs(): Long {
         val paths = listOf(
             "/sys/class/power_supply/battery/current_now",
@@ -100,34 +101,33 @@ class MainActivity : AppCompatActivity() {
                 if (!f.canRead()) continue
                 val raw = f.readText().trim().toLongOrNull() ?: continue
                 val abs = if (raw < 0) -raw else raw
-                // Chuẩn hoá về µA
-                if (abs in 100_000L..15_000_000L) return abs       // đã là µA
-                if (abs in 100L..15_000L) return abs * 1000L       // mA → µA
+                if (abs in 100_000L..15_000_000L) return abs
+                if (abs in 100L..15_000L) return abs * 1000L
                 val div = abs / 1000L
-                if (div in 100_000L..15_000_000L) return div       // chia 1000
+                if (div in 100_000L..15_000_000L) return div
             } catch (_: Exception) {}
         }
         return 0L
     }
 
-    // ─── TẦNG 4: Ước tính dòng sạc dựa trên công suất củ sạc ───
-    private fun estimateCurrentFromCharger(percent: Int): Long {
-        // Thử đọc công suất củ sạc từ sysfs
+    /**
+     * Đọc công suất củ sạc từ sysfs (nếu có).
+     * Trả về W, hoặc 0 nếu không đọc được.
+     */
+    private fun readChargerWattage(): Double {
         val pairs = listOf(
             Pair("/sys/class/power_supply/usb/current_max", "/sys/class/power_supply/usb/voltage_max"),
             Pair("/sys/class/power_supply/ac/current_max", "/sys/class/power_supply/ac/voltage_max"),
             Pair("/sys/class/power_supply/usb/current_max", "/sys/class/power_supply/usb/voltage_now"),
             Pair("/sys/class/power_supply/main/current_max", "/sys/class/power_supply/main/voltage_max")
         )
-        var watts = 0.0
         for ((cp, vp) in pairs) {
             try {
                 val cRaw = File(cp).readText().trim().toLongOrNull() ?: continue
                 val vRaw = File(vp).readText().trim().toLongOrNull() ?: continue
-                // current_max thường ở µA, voltage ở µV
                 val currentA = when {
-                    cRaw > 1_000_000 -> cRaw / 1_000_000.0  // µA → A
-                    cRaw > 1_000     -> cRaw / 1_000.0      // mA → A
+                    cRaw > 1_000_000 -> cRaw / 1_000_000.0
+                    cRaw > 1_000     -> cRaw / 1_000.0
                     else             -> cRaw.toDouble()
                 }
                 val voltageV = when {
@@ -136,23 +136,86 @@ class MainActivity : AppCompatActivity() {
                     else             -> vRaw.toDouble()
                 }
                 val w = currentA * voltageV
-                if (w in 2.0..200.0) { watts = w; break }
+                if (w in 2.0..200.0) return w
             } catch (_: Exception) {}
         }
+        return 0.0
+    }
 
-        // Nếu không đọc được → dùng ước tính theo % pin (sạc nhanh giảm dần)
-        val estimatedWatts = if (watts > 0) watts else when {
-            percent < 20 -> 18.0   // sạc nhanh
-            percent < 50 -> 15.0
-            percent < 80 -> 10.0
-            else         -> 6.0    // gần đầy, dòng tụt
+    // ═══════════════════════════════════════════════════════════
+    // CÁCH B: Ước tính dòng sạc THEO TỪNG MỨC % PIN
+    // Dựa trên đường cong sạc chuẩn của pin lithium-ion.
+    // Trả về dòng sạc (µA) tương ứng với % pin đầu vào.
+    // ═══════════════════════════════════════════════════════════
+    private fun estimateCurrentAtPercent(percent: Int): Long {
+        // Tỷ lệ dòng so với dòng cực đại (peak), theo % pin
+        // Đường cong điển hình: 100% ở 0%, giảm dần đến ~10% ở 100%
+        val ratio = when {
+            percent < 10 -> 1.00
+            percent < 20 -> 0.98
+            percent < 30 -> 0.95
+            percent < 40 -> 0.90
+            percent < 50 -> 0.85
+            percent < 60 -> 0.78
+            percent < 70 -> 0.68
+            percent < 80 -> 0.55
+            percent < 85 -> 0.45
+            percent < 90 -> 0.32
+            percent < 95 -> 0.20
+            percent < 98 -> 0.12
+            else         -> 0.06
         }
 
-        // Hiệu suất sạc ~85%, điện áp pin ~3.85V
+        // Dòng cực đại (peak) suy ra từ công suất củ sạc
+        // Nếu chưa đo được → giả định 18W (sạc nhanh phổ biến)
+        val watts = if (chargerWattage > 0) chargerWattage else 18.0
         val efficiency = 0.85
         val batteryVoltage = 3.85
-        val ua = (estimatedWatts * efficiency / batteryVoltage * 1_000_000).toLong()
-        return ua
+        val peakUa = (watts * efficiency / batteryVoltage * 1_000_000).toLong()
+
+        return (peakUa * ratio).toLong()
+    }
+
+    /**
+     * CÁCH B: Tính tổng thời gian còn lại bằng cách TÍCH PHÂN
+     * đường cong sạc từ % hiện tại đến 100%.
+     *
+     * Thay vì dùng 1 dòng duy nhất, ta chia thành nhiều đoạn nhỏ,
+     * mỗi đoạn có dòng riêng, cộng dồn thời gian.
+     */
+    private fun estimateTimeByCurve(currentPercent: Int, fullCapacityUAh: Long): Int {
+        if (currentPercent !in 1..99) return -1
+
+        var totalMinutes = 0.0
+
+        // Chia mỗi 1% một đoạn
+        for (p in currentPercent until 100) {
+            // Dung lượng cần để tăng 1% ở đoạn p
+            val segmentUAh = fullCapacityUAh / 100L
+
+            // Dòng sạc trung bình của đoạn này (lấy trung bình 2 đầu)
+            val currentStart = estimateCurrentAtPercent(p)
+            val currentEnd   = estimateCurrentAtPercent(p + 1)
+            val avgCurrent   = (currentStart + currentEnd) / 2L
+
+            if (avgCurrent <= 0) continue
+
+            // Thời gian đoạn (phút) = dung lượng / dòng × 60
+            val minutes = segmentUAh.toDouble() / avgCurrent.toDouble() * 60.0
+            totalMinutes += minutes
+        }
+
+        return totalMinutes.toInt()
+    }
+
+    private fun normalizeToUa(raw: Int): Long {
+        if (raw <= 0) return 0L
+        val abs = raw.toLong()
+        if (abs in 100_000L..15_000_000L) return abs
+        if (abs in 100L..15_000L) return abs * 1000L
+        val div = abs / 1000L
+        if (div in 100_000L..15_000_000L) return div
+        return 0L
     }
 
     private fun update(intent: Intent) {
@@ -183,7 +246,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Ghi lịch sử % để tinh chỉnh
         val now = System.currentTimeMillis()
         if (percent != lastPercent) {
             percentHistory.add(now to percent)
@@ -191,7 +253,7 @@ class MainActivity : AppCompatActivity() {
             if (percentHistory.size > 30) percentHistory.removeAt(0)
         }
 
-        // ─── TẦNG 1: API chính thức Android ───
+        // ─── TẦNG 1: API chính thức ───
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             val t = bm.computeChargeTimeRemaining()
             if (t > 0) {
@@ -201,7 +263,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // ─── TẦNG 2: BatteryManager properties ───
+        // ─── Đọc công suất củ sạc (dùng cho tầng 4) ───
+        if (chargerWattage <= 0) {
+            val w = readChargerWattage()
+            if (w > 0) chargerWattage = w
+        }
+
+        // ─── TẦNG 2: BatteryManager ───
         val chargeCounter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
         val avgUa = normalizeToUa(bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE))
         val nowUa = normalizeToUa(bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW))
@@ -225,57 +293,51 @@ class MainActivity : AppCompatActivity() {
             effectiveUa = trimmed.average().toLong()
         }
 
-        // ─── TẦNG 4: Ước tính từ công suất củ sạc ───
-        if (effectiveUa < 100_000L) {
-            effectiveUa = estimateCurrentFromCharger(percent)
-            source = "ước tính"
-        }
-
-        if (percent !in 1..99) {
-            tvTime.text = "Đang cập nhật..."
-            tvCurrent.text = ""
-            return
-        }
-
-        // Tính thời gian còn lại
-        val remainingUah = if (chargeCounter > 100_000) {
-            chargeCounter.toLong() * (100L - percent) / percent
+        // Dung lượng đầy đủ (ưu tiên charge_counter nếu có)
+        val fullCapacityUAh = if (chargeCounter > 100_000 && percent > 0) {
+            chargeCounter.toLong() * 100L / percent
         } else {
-            designCapacityUAh * (100L - percent) / 100L
+            designCapacityUAh
         }
 
-        var mins = (remainingUah.toDouble() / effectiveUa.toDouble() * 60.0).toInt()
+        // ─── Tính thời gian ───
+        var mins: Int
+        var method: String
 
-        // Tinh chỉnh bằng tốc độ % tăng (nếu đã có đủ mẫu)
+        if (effectiveUa >= 100_000L) {
+            // Có dòng thật → dùng công thức thường
+            val remainingUah = fullCapacityUAh * (100L - percent) / 100L
+            mins = (remainingUah.toDouble() / effectiveUa.toDouble() * 60.0).toInt()
+            method = when (source) {
+                "hệ thống" -> String.format(Locale.US, "Dòng TB: %.2f A (hệ thống)", effectiveUa / 1_000_000.0)
+                "sysfs"    -> String.format(Locale.US, "Dòng TB: %.2f A (sysfs)", effectiveUa / 1_000_000.0)
+                else       -> String.format(Locale.US, "Dòng: %.2f A", effectiveUa / 1_000_000.0)
+            }
+        } else {
+            // ─── TẦNG 4 (CÁCH B): Tích phân đường cong sạc ───
+            mins = estimateTimeByCurve(percent, fullCapacityUAh)
+            method = "📊 Ước tính theo đường cong sạc (từng %)"
+        }
+
+        // ─── Tinh chỉnh bằng lịch sử % tăng thực ───
         if (percentHistory.size >= 3) {
             val first = percentHistory.first()
             val last = percentHistory.last()
             val dP = last.second - first.second
             val dT = (last.first - first.first) / 60_000.0
             if (dP >= 2 && dT >= 0.5) {
-                val rate = dP / dT // %/phút
+                val rate = dP / dT
                 val refined = ((100 - percent) / rate).toInt()
-                if (refined in 1..900) mins = refined
+                if (refined in 1..900) {
+                    // Trộn: 60% từ đo thực, 40% từ lý thuyết
+                    mins = (refined * 0.6 + mins * 0.4).toInt()
+                    method += " + hiệu chỉnh thực tế"
+                }
             }
         }
 
         tvTime.text = formatTime(mins)
-
-        tvCurrent.text = when (source) {
-            "hệ thống" -> String.format(Locale.US, "Dòng TB: %.2f A (hệ thống)", effectiveUa / 1_000_000.0)
-            "sysfs"    -> String.format(Locale.US, "Dòng TB: %.2f A (sysfs)", effectiveUa / 1_000_000.0)
-            else       -> String.format(Locale.US, "Dòng ~%.2f A (ước tính)", effectiveUa / 1_000_000.0)
-        }
-    }
-
-    private fun normalizeToUa(raw: Int): Long {
-        if (raw <= 0) return 0L
-        val abs = raw.toLong()
-        if (abs in 100_000L..15_000_000L) return abs
-        if (abs in 100L..15_000L) return abs * 1000L
-        val div = abs / 1000L
-        if (div in 100_000L..15_000_000L) return div
-        return 0L
+        tvCurrent.text = method
     }
 
     private fun formatTime(minutes: Int): String {
