@@ -24,7 +24,6 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var lastIntent: Intent? = null
 
-    // Bộ đệm mẫu dòng điện (chỉ dùng khi máy không có CURRENT_AVERAGE)
     private val currentSamples = ArrayList<Long>()
     private var designCapacityUAh = 5_000_000L
 
@@ -109,7 +108,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // ─── TẦNG 1: API chính thức Android (nhanh + chính xác nhất khi có dữ liệu) ───
+        // ─── TẦNG 1: API chính thức Android ───
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             val timeRemaining = bm.computeChargeTimeRemaining()
             if (timeRemaining > 0) {
@@ -120,19 +119,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // ─── TẦNG 2: Dự phòng tức thì — dùng CURRENT_AVERAGE + CHARGE_COUNTER ───
+        // ─── TẦNG 2: Dự phòng tức thì ───
         val chargeCounter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
         val avgCurrentUa  = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE)
         val nowCurrentUa  = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
 
-        // Chuẩn hoá đơn vị (một số máy trả về mA thay vì µA)
         val avgUa = normalizeToUa(avgCurrentUa)
         val nowUa = normalizeToUa(nowCurrentUa)
 
-        // Ưu tiên CURRENT_AVERAGE, nếu không có thì dùng CURRENT_NOW
         var effectiveUa = if (avgUa > 100_000L) avgUa else nowUa
 
-        // Nếu vẫn không có, dùng trung bình trượt từ CURRENT_NOW
         if (effectiveUa < 100_000L) {
             if (nowUa in 100_000L..8_000_000L) {
                 currentSamples.add(nowUa)
@@ -154,19 +150,15 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Tính thời gian còn lại
         val remainingUah = if (chargeCounter > 100_000) {
-            // Dùng dung lượng thực đo được (chính xác nhất)
             chargeCounter.toLong() * (100L - percent) / percent
         } else {
-            // Dùng dung lượng thiết kế
             designCapacityUAh * (100L - percent) / 100L
         }
 
         val mins = (remainingUah.toDouble() / effectiveUa.toDouble() * 60.0).toInt()
         tvTime.text = formatTime(mins)
 
-        // Hiển thị nguồn dữ liệu để bạn biết app đang dùng gì
         tvCurrent.text = when {
             avgUa > 100_000L -> String.format(Locale.US, "Dòng TB: %.2f A (hệ thống)", avgUa / 1_000_000.0)
             currentSamples.isNotEmpty() -> String.format(Locale.US, "Dòng TB: %.2f A (n=%d)", effectiveUa / 1_000_000.0, currentSamples.size)
@@ -174,14 +166,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Chuẩn hoá dòng điện về µA (một số ROM trả về mA)
+    // Hàm nhận diện đơn vị dòng điện thông minh
     private fun normalizeToUa(raw: Int): Long {
-        val abs = if (raw < 0) -raw.toLong() else raw.toLong()
-        return when {
-            abs < 100L    -> 0L
-            abs < 10_000L -> abs * 1000L   // mA → µA
-            else          -> abs           // đã là µA
-        }
+        if (raw <= 0) return 0L
+        val abs = raw.toLong()
+        // Dải µA hợp lệ (từ 0.1A đến 15A)
+        if (abs in 100_000L..15_000_000L) return abs
+        // Dải mA hợp lệ (từ 0.1A đến 15A) -> chuyển sang µA
+        if (abs in 100L..15_000L) return abs * 1000L
+        // Giá trị lạ (như 2147.480.000) -> thử chia 1000 xem có về dải µA không
+        val divided = abs / 1000L
+        if (divided in 100_000L..15_000_000L) return divided
+        return 0L // Bó tay, trả về 0
     }
 
     private fun formatTime(minutes: Int): String {
@@ -192,7 +188,7 @@ class MainActivity : AppCompatActivity() {
             h > 0 && m > 0 -> "Còn khoảng $h giờ $m phút nữa đầy"
             h > 0 -> "Còn khoảng $h giờ nữa đầy"
             m > 0 -> "Còn khoảng $m phút nữa đầy"
-            else -> "Sắp đầy rồi!"
+            else -> "Còn dưới 1 phút nữa" // Sửa thành câu này cho đỡ "sắp đầy rồi"
         }
     }
 }
